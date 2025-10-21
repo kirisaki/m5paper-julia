@@ -3,6 +3,7 @@
 #include <math.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
+#include <freertos/queue.h>
 #include <esp_heap_caps.h>
 
 // ---------- Parameters ----------
@@ -18,10 +19,11 @@ struct RenderParams
   float scale = 240.0f; // larger = zoomed out
 
   // Display / quality
-  int strip_h = 16;    // sprite band height
+  int strip_h = 16;    // sprite band height for drawing
   float gamma = 0.85f; // <1 brighter, >1 darker
   bool show_time = true;
   bool smooth = true; // smooth coloring on/off
+  int segments = 16;  // <-- number of compute segments (task partition)
   m5gfx::epd_mode_t progressive_mode = m5gfx::epd_mode_t::epd_fast;
   m5gfx::epd_mode_t final_mode = m5gfx::epd_mode_t::epd_quality;
 };
@@ -30,7 +32,8 @@ struct RenderParams
 static TaskHandle_t g_mainTask = nullptr;
 static uint8_t *g_frame8 = nullptr; // W*H 8-bit gray (post-gamma)
 static int gW = 0, gH = 0;
-static RenderParams g_rp; // snapshot for workers
+static RenderParams g_rp;               // snapshot for workers
+static QueueHandle_t g_workQ = nullptr; // work queue
 
 // Gamma LUT cache
 static uint8_t GAMMA_LUT[256];
@@ -81,96 +84,132 @@ static void ensureFrameBuffer()
   }
 }
 
-// ---------- Worker (runs on both cores with different ranges) ----------
+// ---------- Work item ----------
 struct WorkRange
 {
   int y_begin;
   int y_end;
-};
+}; // [y_begin, y_end)
 
-static void computeWorker(void *arg)
+// ---------- Worker (runs on both cores; pulls from queue) ----------
+static void computeWorkerQ(void *arg)
 {
-  WorkRange range = *(WorkRange *)arg; // copy
-  const RenderParams rp = g_rp;        // snapshot
+  (void)arg;
+  const RenderParams rp = g_rp; // snapshot
   ensure_gamma(rp.gamma);
 
   const float esc2 = rp.escape_radius * rp.escape_radius;
   const float halfW = 0.5f * gW, halfH = 0.5f * gH;
   const float invS = 1.0f / rp.scale;
 
-  for (int py = range.y_begin; py < range.y_end; ++py)
+  for (;;)
   {
-    float zy0 = rp.center_y + (py - halfH) * invS;
-    uint8_t *row = &g_frame8[py * gW];
-    for (int px = 0; px < gW; ++px)
+    WorkRange r;
+    if (xQueueReceive(g_workQ, &r, portMAX_DELAY) != pdTRUE)
+      continue;
+    if (r.y_begin < 0)
+      break; // sentinel to exit
+
+    for (int py = r.y_begin; py < r.y_end; ++py)
     {
-      float zx = rp.center_x + (px - halfW) * invS;
-      float zy = zy0;
+      float zy0 = rp.center_y + (py - halfH) * invS;
+      uint8_t *row = &g_frame8[py * gW];
 
-      int iter = 0;
-      float r2 = 0.f;
-      while (iter < rp.max_iter)
+      for (int px = 0; px < gW; ++px)
       {
-        float zx2 = zx * zx - zy * zy + rp.c_re;
-        float zy2 = 2.0f * zx * zy + rp.c_im;
-        zx = zx2;
-        zy = zy2;
-        r2 = zx * zx + zy * zy;
-        if (r2 > esc2)
-          break;
-        ++iter;
-      }
+        float zx = rp.center_x + (px - halfW) * invS;
+        float zy = zy0;
 
-      uint8_t g8;
-      if (!rp.smooth)
-      {
-        g8 = (iter >= rp.max_iter) ? 0 : (uint8_t)(255.0f * iter / rp.max_iter);
-      }
-      else
-      {
-        if (iter >= rp.max_iter)
+        int iter = 0;
+        float r2 = 0.f;
+        while (iter < rp.max_iter)
         {
-          g8 = 0;
+          float zx2 = zx * zx - zy * zy + rp.c_re;
+          float zy2 = 2.0f * zx * zy + rp.c_im;
+          zx = zx2;
+          zy = zy2;
+          r2 = zx * zx + zy * zy;
+          if (r2 > esc2)
+            break;
+          ++iter;
+        }
+
+        uint8_t g8;
+        if (!rp.smooth)
+        {
+          g8 = (iter >= rp.max_iter) ? 0 : (uint8_t)(255.0f * iter / rp.max_iter);
         }
         else
         {
-          // Accurate smooth coloring
-          float zn = sqrtf(r2);
-          float nu = log2f(logf(zn) / logf(rp.escape_radius));
-          float t = (iter + 1.0f - nu) / rp.max_iter; // 0..1
-          if (t < 0)
-            t = 0;
-          if (t > 1)
-            t = 1;
-          g8 = (uint8_t)lroundf(t * 255.0f);
+          if (iter >= rp.max_iter)
+          {
+            g8 = 0;
+          }
+          else
+          {
+            // Accurate smooth coloring
+            float zn = sqrtf(r2);
+            float nu = log2f(logf(zn) / logf(rp.escape_radius));
+            float t = (iter + 1.0f - nu) / rp.max_iter; // 0..1
+            if (t < 0)
+              t = 0;
+            if (t > 1)
+              t = 1;
+            g8 = (uint8_t)lroundf(t * 255.0f);
+          }
         }
+        row[px] = GAMMA_LUT[g8]; // post-gamma grayscale
       }
-      row[px] = GAMMA_LUT[g8]; // post-gamma grayscale
     }
   }
 
-  // Notify main task that this worker finished
+  // done
   xTaskNotifyGive(g_mainTask);
   vTaskDelete(nullptr);
 }
 
-// Kick two workers: one on Core1 (APP), one on Core0 (PRO)
-static void computeFrameTwoCores(const RenderParams &rp)
+// ---------- Kick two workers and wait ----------
+static void computeFrameWithQueue(const RenderParams &rp)
 {
-  g_rp = rp; // snapshot for workers
-  WorkRange upper{0, gH / 2};
-  WorkRange lower{gH / 2, gH};
+  g_rp = rp; // snapshot
+  // (Re)create queue sized for all segments + 2 sentinels
+  int segs = rp.segments < 2 ? 2 : rp.segments;
+  if (g_workQ)
+  {
+    vQueueDelete(g_workQ);
+    g_workQ = nullptr;
+  }
+  g_workQ = xQueueCreate(segs + 2, sizeof(WorkRange));
 
-  // create both workers; different cores
-  xTaskCreatePinnedToCore(computeWorker, "wrk0", 8192, &upper, 1, nullptr, 0); // Core0
-  xTaskCreatePinnedToCore(computeWorker, "wrk1", 8192, &lower, 1, nullptr, 1); // Core1
+  // Partition H into 'segs' chunks
+  int base = gH / segs, rem = gH % segs;
+  int y = 0;
+  for (int i = 0; i < segs; ++i)
+  {
+    int h = base + (i < rem ? 1 : 0);
+    WorkRange r{y, y + h};
+    xQueueSend(g_workQ, &r, portMAX_DELAY);
+    y += h;
+  }
+  // Push 2 sentinels (one per worker)
+  WorkRange s{-1, -1};
+  xQueueSend(g_workQ, &s, portMAX_DELAY);
+  xQueueSend(g_workQ, &s, portMAX_DELAY);
 
-  // wait for both (two notifications)
+  // Start two workers: one on each core
+  xTaskCreatePinnedToCore(computeWorkerQ, "wrk0", 8192, nullptr, 1, nullptr, 0); // Core0
+  xTaskCreatePinnedToCore(computeWorkerQ, "wrk1", 8192, nullptr, 1, nullptr, 1); // Core1
+
+  // Wait for both workers to notify completion
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+  // Clean up queue
+  vQueueDelete(g_workQ);
+  g_workQ = nullptr;
 }
 
-// ---------- Rendering (keep drawPixel path & display timing) ----------
+// ---------- Rendering ----------
 static void renderJulia(const RenderParams &rp)
 {
   const int W = M5.Display.width();
@@ -183,8 +222,8 @@ static void renderJulia(const RenderParams &rp)
   M5.Display.setEpdMode(rp.progressive_mode);
   M5.Display.clear();
 
-  // ---- compute on two cores (no drawing yet) ----
-  computeFrameTwoCores(rp);
+  // ---- compute on two cores with segmented work queue ----
+  computeFrameWithQueue(rp);
 
   // ---- draw with drawPixel exactly as before ----
   lgfx::LGFX_Sprite spr(&M5.Display);
@@ -205,7 +244,7 @@ static void renderJulia(const RenderParams &rp)
       }
     }
     spr.pushSprite(0, y0);
-    M5.Display.display(); // ※描画回数の最適化は“しない”指定なのでそのまま
+    M5.Display.display();
   }
 
   // Final GC16 for smooth tone
@@ -246,19 +285,16 @@ void loop()
 {
   M5.update();
 
-  // BtnA: toggle time overlay
   if (M5.BtnB.wasPressed())
   {
     rp.show_time = !rp.show_time;
     renderJulia(rp);
   }
-  // BtnB: zoom in
-  if (M5.BtnC.wasPressed())
+  if (M5.BtnA.wasPressed())
   {
     rp.scale *= 1.2f;
     renderJulia(rp);
   }
-  // BtnC: zoom out
   if (M5.BtnC.wasPressed())
   {
     rp.scale /= 1.2f;
