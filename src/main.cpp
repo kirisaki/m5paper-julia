@@ -6,6 +6,17 @@
 #include <freertos/queue.h>
 #include <esp_heap_caps.h>
 
+// Fallback for clamp_val (not available in C++14)
+template <typename T>
+static inline T clamp_val(T v, T lo, T hi)
+{
+  if (v < lo)
+    return lo;
+  if (v > hi)
+    return hi;
+  return v;
+}
+
 // ---------- Parameters ----------
 struct RenderParams
 {
@@ -23,7 +34,7 @@ struct RenderParams
   float gamma = 0.85f; // <1 brighter, >1 darker
   bool show_time = true;
   bool smooth = true; // smooth coloring on/off
-  int segments = 16;  // <-- number of compute segments (task partition)
+  int segments = 16;  // number of compute segments (task partition)
   m5gfx::epd_mode_t progressive_mode = m5gfx::epd_mode_t::epd_fast;
   m5gfx::epd_mode_t final_mode = m5gfx::epd_mode_t::epd_quality;
 };
@@ -35,9 +46,15 @@ static int gW = 0, gH = 0;
 static RenderParams g_rp;               // snapshot for workers
 static QueueHandle_t g_workQ = nullptr; // work queue
 
-// Gamma LUT cache
+// --- Auto-random timing ---
+static uint32_t g_lastChangeMs = 0;
+static uint32_t g_lastUserOpMs = 0;
+static const uint32_t kChangeIntervalMs = 10000; // change params every 10s (if no recent user op)
+
+// ---------- Gamma LUT ----------
 static uint8_t GAMMA_LUT[256];
 static float LAST_GAMMA = -1.0f;
+
 static inline void ensure_gamma(float gamma)
 {
   if (gamma == LAST_GAMMA)
@@ -122,14 +139,22 @@ static void computeWorkerQ(void *arg)
 
         int iter = 0;
         float r2 = 0.f;
+
+        // Iterate z ← z^2 + c   (with NaN/Inf guard)
         while (iter < rp.max_iter)
         {
-          float zx2 = zx * zx - zy * zy + rp.c_re;
-          float zy2 = 2.0f * zx * zy + rp.c_im;
-          zx = zx2;
-          zy = zy2;
+          float xx = zx * zx - zy * zy + rp.c_re;
+          float yy = 2.0f * zx * zy + rp.c_im;
+          if (!isfinite(xx) || !isfinite(yy))
+          { // guard against NaN/Inf
+            iter = rp.max_iter;
+            break;
+          }
+          zx = xx;
+          zy = yy;
+
           r2 = zx * zx + zy * zy;
-          if (r2 > esc2)
+          if (!isfinite(r2) || r2 > esc2)
             break;
           ++iter;
         }
@@ -147,9 +172,10 @@ static void computeWorkerQ(void *arg)
           }
           else
           {
-            // Accurate smooth coloring
-            float zn = sqrtf(r2);
-            float nu = log2f(logf(zn) / logf(rp.escape_radius));
+            // Safe smooth coloring
+            float zn = sqrtf(fmaxf(r2, 1e-30f));
+            float denom = fmaxf(rp.escape_radius, 1.0001f);
+            float nu = log2f(logf(zn) / logf(denom));
             float t = (iter + 1.0f - nu) / rp.max_iter; // 0..1
             if (t < 0)
               t = 0;
@@ -172,7 +198,6 @@ static void computeWorkerQ(void *arg)
 static void computeFrameWithQueue(const RenderParams &rp)
 {
   g_rp = rp; // snapshot
-  // (Re)create queue sized for all segments + 2 sentinels
   int segs = rp.segments < 2 ? 2 : rp.segments;
   if (g_workQ)
   {
@@ -181,7 +206,6 @@ static void computeFrameWithQueue(const RenderParams &rp)
   }
   g_workQ = xQueueCreate(segs + 2, sizeof(WorkRange));
 
-  // Partition H into 'segs' chunks
   int base = gH / segs, rem = gH % segs;
   int y = 0;
   for (int i = 0; i < segs; ++i)
@@ -191,20 +215,19 @@ static void computeFrameWithQueue(const RenderParams &rp)
     xQueueSend(g_workQ, &r, portMAX_DELAY);
     y += h;
   }
-  // Push 2 sentinels (one per worker)
+  // two sentinels (one per worker)
   WorkRange s{-1, -1};
   xQueueSend(g_workQ, &s, portMAX_DELAY);
   xQueueSend(g_workQ, &s, portMAX_DELAY);
 
-  // Start two workers: one on each core
+  // two workers: one on each core
   xTaskCreatePinnedToCore(computeWorkerQ, "wrk0", 8192, nullptr, 1, nullptr, 0); // Core0
   xTaskCreatePinnedToCore(computeWorkerQ, "wrk1", 8192, nullptr, 1, nullptr, 1); // Core1
 
-  // Wait for both workers to notify completion
+  // wait both
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
 
-  // Clean up queue
   vQueueDelete(g_workQ);
   g_workQ = nullptr;
 }
@@ -222,10 +245,10 @@ static void renderJulia(const RenderParams &rp)
   M5.Display.setEpdMode(rp.progressive_mode);
   M5.Display.clear();
 
-  // ---- compute on two cores with segmented work queue ----
+  // compute on two cores
   computeFrameWithQueue(rp);
 
-  // ---- draw with drawPixel exactly as before ----
+  // draw with sprite + drawPixel (keeps your cadence)
   lgfx::LGFX_Sprite spr(&M5.Display);
   spr.setColorDepth(16);
   spr.createSprite(W, rp.strip_h);
@@ -233,7 +256,7 @@ static void renderJulia(const RenderParams &rp)
   for (int y0 = 0; y0 < H; y0 += rp.strip_h)
   {
     int h = std::min(rp.strip_h, H - y0);
-    spr.clear();
+    // spr.clear(); // full overwrite → not needed
     for (int yy = 0; yy < h; ++yy)
     {
       int py = y0 + yy;
@@ -247,7 +270,7 @@ static void renderJulia(const RenderParams &rp)
     M5.Display.display();
   }
 
-  // Final GC16 for smooth tone
+  // final GC16
   M5.Display.setEpdMode(rp.final_mode);
   M5.Display.display();
 
@@ -267,6 +290,80 @@ static void renderJulia(const RenderParams &rp)
   }
 }
 
+// ---------- Helpers for randomization ----------
+static inline float frand(float minv, float maxv)
+{
+  return minv + (maxv - minv) * ((float)esp_random() / (float)UINT32_MAX);
+}
+
+// Keep parameters in safe ranges to avoid NaN or blank frames
+static void sanitize(RenderParams &rp)
+{
+  if (!isfinite(rp.scale))
+    rp.scale = 240.0f;
+  rp.scale = clamp_val(rp.scale, 80.0f, 12000.0f);
+
+  if (!isfinite(rp.gamma))
+    rp.gamma = 0.85f;
+  rp.gamma = clamp_val(rp.gamma, 0.60f, 1.40f);
+
+  if (!isfinite(rp.center_x))
+    rp.center_x = 0.0f;
+  if (!isfinite(rp.center_y))
+    rp.center_y = 0.0f;
+
+  rp.c_re = clamp_val(rp.c_re, -1.5f, 1.5f);
+  rp.c_im = clamp_val(rp.c_im, -1.5f, 1.5f);
+}
+
+// ---- Helpers to pick c within "good" regions of the Mandelbrot set ----
+
+// Cardioid parameterization (interior of the main cardioid):
+//     c(θ) = 0.5 e^{iθ} - 0.25 e^{2iθ}
+// Optional scale 's' moves slightly toward/away from the boundary (1.0 = exact).
+static inline void pick_c_cardioid(float theta, float s, float &cre, float &cim)
+{
+  float c1 = cosf(theta), s1 = sinf(theta);
+  float c2 = cosf(2 * theta), s2 = sinf(2 * theta);
+  cre = s * (0.5f * c1 - 0.25f * c2);
+  cim = s * (0.5f * s1 - 0.25f * s2);
+}
+
+// Period-2 bulb (center -1, radius 1/4):  c(θ) = -1 + (1/4) e^{iθ}
+// Scale 's' again nudges toward/away from boundary.
+static inline void pick_c_bulb2(float theta, float s, float &cre, float &cim)
+{
+  cre = -1.0f + 0.25f * s * cosf(theta);
+  cim = 0.25f * s * sinf(theta);
+}
+
+// Simple RNG helper (0..1)
+static inline float urand()
+{
+  return (float)esp_random() / (float)UINT32_MAX;
+}
+
+static void randomizeParams(RenderParams &rp)
+{
+  float theta = 2.0f * (float)M_PI * urand();
+  float s = 0.95f + 0.10f * urand(); // 0.95..1.05 (nudges toward boundary)
+  if (urand() < 0.8f)
+  {
+    pick_c_cardioid(theta, s, rp.c_re, rp.c_im);
+  }
+  else
+  {
+    pick_c_bulb2(theta, s, rp.c_re, rp.c_im);
+  }
+
+  float g = rp.gamma + (urand() * 2.0f - 1.0f) * 0.04f;
+  if (g < 0.70f)
+    g = 0.70f;
+  if (g > 1.10f)
+    g = 1.10f;
+  rp.gamma = g;
+}
+
 // ---------- UI ----------
 static RenderParams rp;
 
@@ -278,26 +375,47 @@ void setup()
   M5.begin(cfg);
   M5.Display.setRotation(3);
 
+  g_lastChangeMs = millis();
+  g_lastUserOpMs = 0;
+
+  sanitize(rp);
   renderJulia(rp);
 }
 
 void loop()
 {
   M5.update();
+  uint32_t now = millis();
 
+  // --- manual controls ---
   if (M5.BtnB.wasPressed())
   {
     rp.show_time = !rp.show_time;
+    sanitize(rp);
     renderJulia(rp);
+    g_lastUserOpMs = now;
   }
   if (M5.BtnA.wasPressed())
   {
     rp.scale *= 1.2f;
+    sanitize(rp);
     renderJulia(rp);
+    g_lastUserOpMs = now;
   }
   if (M5.BtnC.wasPressed())
   {
     rp.scale /= 1.2f;
+    sanitize(rp);
+    renderJulia(rp);
+    g_lastUserOpMs = now;
+  }
+
+  // --- auto random change every kChangeIntervalMs (skip shortly after user ops) ---
+  if (now - g_lastChangeMs > kChangeIntervalMs && now - g_lastUserOpMs > 6000)
+  {
+    g_lastChangeMs = now;
+    randomizeParams(rp);
+    sanitize(rp);
     renderJulia(rp);
   }
 }
